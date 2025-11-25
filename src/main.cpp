@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <thread>
 #include <future>
+#include <algorithm>
 
 #include "../include/basicIO.h"
 #include "../include/CommunicationStandard.h"
@@ -14,7 +15,7 @@
 #include "../include/CellTower.h"
 #include "../include/CellularCore.h"
 
-// Template helper (still allowed)
+// Helper template
 template<typename T>
 T clamp_val(T v, T lo, T hi) {
     if (v < lo) return lo;
@@ -22,10 +23,20 @@ T clamp_val(T v, T lo, T hi) {
     return v;
 }
 
-// Worker function (no I/O allowed inside threads)
-static int compute_messages_range(CommunicationStandard* standard, int count) {
-    if (!standard) return 0;
-    return count * standard->messagesPerUser();
+// Worker function (no I/O inside)
+struct ThreadResult {
+    int users;
+    int messages;
+    std::thread::id tid;
+};
+
+static ThreadResult compute_messages_range(CommunicationStandard* standard, int count) {
+    ThreadResult r;
+    r.users = count;
+    r.messages = (standard ? count * standard->messagesPerUser() : 0);
+    r.tid = std::this_thread::get_id();
+    // small simulated work (no I/O)
+    return r;
 }
 
 int main() {
@@ -49,24 +60,49 @@ int main() {
         return 1;
     }
 
+    // Create tower/core using provided standard
     CellTower tower(standard.get());
     CellularCore core(standard.get());
 
+    int requestedUsers = -1;
     io.outputstring("Enter number of user devices to add:\n");
-    int n = io.inputint();
-    n = clamp_val(n, 0, 200000);
 
-    for (int i = 0; i < n; ++i) {
+    while (true) {
+        requestedUsers = io.inputint();
+
+        // basicIO returns 0 for bad input or if user types 0
+        if (requestedUsers > 0) {
+            break; // valid number
+        }
+
+        io.errorstring("Invalid input. Please enter a positive integer:\n");
+    }
+
+    requestedUsers = clamp_val(requestedUsers, 0, 10000000); // safety cap
+
+    // Compute capacity
+    int supported = tower.totalSupportedUsers();
+
+    // If user requested more than supported, auto-limit and warn
+    int usersToAdd = requestedUsers;
+    if (requestedUsers > supported) {
+        io.outputstring("Warning: Tower supports max ");
+        io.outputint(supported);
+        io.outputstring(" users. You requested ");
+        io.outputint(requestedUsers);
+        io.outputstring(". Adding only the maximum supported users.\n");
+        usersToAdd = supported;
+    }
+
+    // Add (possibly limited) users
+    for (int i = 0; i < usersToAdd; ++i) {
         tower.addUser(UserDevice(i + 1));
     }
 
     int totalUsers = tower.currentUserCount();
-    int supported  = tower.totalSupportedUsers();
     int channels   = tower.numChannels();
 
-    // ----------------------------
-    // MULTITHREADED MESSAGE SUM
-    // ----------------------------
+    // MULTITHREAD: split work across hardware threads
     unsigned int hw_threads = std::thread::hardware_concurrency();
     if (hw_threads == 0) hw_threads = 2;
 
@@ -74,28 +110,27 @@ int main() {
     if (workers > totalUsers) workers = totalUsers;
     if (workers <= 0) workers = 1;
 
-    std::vector<std::future<int>> fut;
-    fut.reserve(workers);
+    std::vector<std::future<ThreadResult>> futures;
+    futures.reserve(workers);
 
     int base = totalUsers / workers;
     int rem  = totalUsers % workers;
 
     for (int w = 0; w < workers; ++w) {
         int count = base + (w < rem ? 1 : 0);
-        fut.push_back(std::async(std::launch::async,
-                                 compute_messages_range,
-                                 standard.get(),
-                                 count));
+        futures.push_back(std::async(std::launch::async,
+                    compute_messages_range, standard.get(), count));
     }
 
     long long msgs_sum = 0;
-    for (size_t i = 0; i < fut.size(); ++i) {
-        msgs_sum += fut[i].get();
+    std::vector<ThreadResult> results;
+    for (auto &f : futures) {
+        ThreadResult r = f.get();
+        results.push_back(r);
+        msgs_sum += r.messages;
     }
 
-    // ----------------------------
     // OUTPUT RESULTS
-    // ----------------------------
     io.outputstring("--- Simulation Results ---\n");
 
     io.outputstring("Total channels: ");
@@ -114,7 +149,6 @@ int main() {
     io.outputint((int)msgs_sum);
     io.outputstring("\n");
 
-    // First channel user list
     io.outputstring("Users in first channel (IDs): ");
     std::vector<UserDevice> first = tower.usersInFirstChannel();
     for (size_t i = 0; i < first.size(); ++i) {
@@ -123,35 +157,46 @@ int main() {
     }
     io.outputstring("\n");
 
-    // Extra: 4G core estimate (allowed)
+    // Per-thread stats (no I/O inside threads; main prints)
+    io.outputstring("Per-thread processing:\n");
+    for (size_t i = 0; i < results.size(); ++i) {
+        io.outputstring(" Thread ");
+        io.outputint((int)i + 1);
+        io.outputstring(": processed ");
+        io.outputint(results[i].users);
+        io.outputstring(" users; messages=");
+        io.outputint(results[i].messages);
+        io.outputstring("\n");
+    }
+
+    // 4G extra cores estimation (if applicable)
     FourG* fg = dynamic_cast<FourG*>(standard.get());
     if (fg != 0) {
         int fullUsers = supported;
-        int coreCap = 1000;
-        int need = (compute_messages_range(standard.get(), fullUsers) + coreCap - 1) / coreCap;
-
-        io.outputstring("4G approx cores needed (1000 msg/core): ");
-        io.outputint(need);
+        int coreCapacity = 1000;
+        int coresNeeded = (fullUsers * fg->messagesPerUser() + coreCapacity - 1) / coreCapacity;
+        io.outputstring("For 4G, approx cores needed (assuming 1000 msg/core): ");
+        io.outputint(coresNeeded);
         io.outputstring("\n");
     }
 
     // ===========================
     // SPEED INFORMATION
     // ===========================
-
     io.outputstring("Speed of selected technology: ");
-    int s10 = standard->speedMbps();  // stored as Mbps × 10
-    io.outputint(s10 / 10);   // whole part
+    int s10 = standard->speedMbpsTimes10();  // Mbps × 10
+    io.outputint(s10 / 10);
     io.outputstring(".");
-    io.outputint(s10 % 10);   // decimal part
+    io.outputint(s10 % 10);
     io.outputstring(" Mbps\n");
 
-    // Relative comparison with 2G (base = 0.1 Mbps stored as 1)
+    // Relative comparison with 2G (base = 2G stored as 1)
     io.outputstring("Relative speed compared to 2G: ");
-    int factor = s10 / 1;   // since 2G = 1 (0.1 Mbps)
+    int factor = s10 / 1;   // 2G stored as 1
     io.outputint(factor);
     io.outputstring("x faster\n");
 
     io.terminate();
     return 0;
 }
+//garima

@@ -8,10 +8,7 @@ class CellTower {
 std::vector<UserDevice> users;
 CommunicationStandard* standard; // not owned
 public:
-CellTower(CommunicationStandard* s): standard(s) {
-if (!s) throw ConfigError("Null standard passed to CellTower");
-}
-
+CellTower(CommunicationStandard* s): standard(s) {}
 
 void addUser(const UserDevice& u) { users.push_back(u); }
 
@@ -36,3 +33,4 @@ return out;
 
 int currentUserCount() const { return (int)users.size(); }
 };
+//garima

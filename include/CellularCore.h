@@ -5,8 +5,9 @@
 class CellularCore {
 CommunicationStandard* standard; // not owned
 public:
-CellularCore(CommunicationStandard* s): standard(s) { if(!s) throw ConfigError("Null standard to core"); }
+CellularCore(CommunicationStandard* s): standard(s) {}
 int messagesGenerated(int users) const {
 return users * standard->messagesPerUser();
 }
 };
+//garima
