@@ -1,10 +1,14 @@
 #pragma once
-
+#ifndef USERDEVICE_H
+#define USERDEVICE_H
 
 class UserDevice {
-int id;
+    int id;
 public:
-explicit UserDevice(int id): id(id) {}
-int getID() const { return id; }
+    UserDevice(): id(0) {}
+    UserDevice(int _id): id(_id) {}
+    int getID() const { return id; }
 };
-//garima
+
+#endif
+//Updated by Gagandeep

@@ -1,36 +1,72 @@
 #pragma once
-#include <vector>
+#ifndef CELLTOWER_H
+#define CELLTOWER_H
+
 #include "UserDevice.h"
 #include "CommunicationStandard.h"
 
-
 class CellTower {
-std::vector<UserDevice> users;
-CommunicationStandard* standard; // not owned
+    CommunicationStandard* standard;
+    UserDevice* usersArr; // dynamic array
+    int arrCap;
+    int arrCount;
 public:
-CellTower(CommunicationStandard* s): standard(s) {}
+    CellTower(CommunicationStandard* s): standard(s), usersArr(nullptr), arrCap(0), arrCount(0) {}
+    ~CellTower() {
+        if (usersArr) delete [] usersArr;
+        usersArr = nullptr;
+        arrCap = 0;
+        arrCount = 0;
+    }
 
-void addUser(const UserDevice& u) { users.push_back(u); }
+    void reserve(int n) {
+        if (n <= arrCap) return;
+        UserDevice* newArr = new UserDevice[n];
+        for (int i = 0; i < arrCount; ++i) newArr[i] = usersArr[i];
+        if (usersArr) delete [] usersArr;
+        usersArr = newArr;
+        arrCap = n;
+    }
 
+    void addUser(const UserDevice& u) {
+        if (arrCount >= arrCap) {
+            int newCap = (arrCap == 0) ? 16 : arrCap * 2;
+            reserve(newCap);
+        }
+        usersArr[arrCount++] = u;
+    }
 
-int numChannels() const {
-return standard->totalBandwidthKHz() / standard->channelBandwidthKHz();
-}
+    int currentUserCount() const { return arrCount; }
 
+    const UserDevice* userArray() const { return usersArr; }
 
-int totalSupportedUsers() const {
-return numChannels() * standard->usersPerChannel() * standard->antennas();
-}
+    int numChannels() const {
+        int ch = standard->totalBandwidthKHz() / standard->channelBandwidthKHz();
+        return (ch > 0) ? ch : 0;
+    }
 
+    int usersPerChanCapacity() const {
+        return standard->usersPerChannel() * standard->antennas();
+    }
 
-std::vector<UserDevice> usersInFirstChannel() const {
-int capacity = standard->usersPerChannel() * standard->antennas();
-std::vector<UserDevice> out;
-for (int i = 0; i < capacity && i < (int)users.size(); ++i) out.push_back(users[i]);
-return out;
-}
+    int totalSupportedUsers() const {
+        long long ch = numChannels();
+        long long perChan = usersPerChanCapacity();
+        long long total = ch * perChan;
+        if (total > 2147483647LL) return 2147483647;
+        return (int)total;
+    }
 
-
-int currentUserCount() const { return (int)users.size(); }
+    // copies first-channel users into outBuffer (outBuf must be large enough)
+    int usersInFirstChannel(UserDevice* outBuf, int bufSize) const {
+        if (!outBuf || bufSize <= 0) return 0;
+        int take = usersPerChanCapacity();
+        if (take > arrCount) take = arrCount;
+        if (take > bufSize) take = bufSize;
+        for (int i = 0; i < take; ++i) outBuf[i] = usersArr[i];
+        return take;
+    }
 };
-//garima
+
+#endif
+//Updated by Gagandeep

@@ -1,16 +1,18 @@
 #pragma once
+#ifndef COMMUNICATIONSTANDARD_H
+#define COMMUNICATIONSTANDARD_H
 
 class CommunicationStandard {
 public:
-    virtual int usersPerChannel() const = 0;     // base users per channel (per antenna)
-    virtual int messagesPerUser() const = 0;     // messages generated per user
-    virtual int channelBandwidthKHz() const = 0; // channel width in kHz
-    virtual int totalBandwidthKHz() const = 0;   // total allocated bandwidth in kHz
-    virtual int antennas() const { return 1; }   // default single antenna
-
-    // speed in Mbps * 10 (integer) to avoid floating I/O
+    virtual int usersPerChannel() const = 0;
+    virtual int messagesPerUser() const = 0;
+    virtual int channelBandwidthKHz() const = 0;
+    virtual int totalBandwidthKHz() const = 0;
+    virtual int antennas() const { return 1; }
     virtual int speedMbpsTimes10() const = 0;
-
+    virtual int overheadPer100Messages() const = 0;
     virtual ~CommunicationStandard() {}
 };
-//garima
+
+#endif
+//Updated by Gagandeep
