@@ -7,238 +7,306 @@
 #include "../include/UserDevice.h"
 #include "../include/CellTower.h"
 #include "../include/CellularCore.h"
-#include <thread> // allowed
 
-// helper: integer ceil division
+#include "../include/Exception.h"
+#include "../include/TemplateUtilities.h"
+#include "../include/ChannelRange.h"
+
+#include <pthread.h>
+#include <unistd.h>   // sysconf()
+
+// ==================== Helpers =====================
 static long long div_up(long long a, long long b) {
     if (b == 0) return 0;
     return (a + b - 1) / b;
 }
 
-// Simulated core message rate per core (design parameter)
-const long long CORE_MSG_RATE = 1000LL; // messages/sec per core (simulation window)
+const long long CORE_MSG_RATE = 1000LL;
 
-// compute simulated time for single-threaded (one core)
-static long long simulated_time_ms_nonthread(long long totalMessages, int cores) {
-    if (cores <= 0) cores = 1;
-    long long denom = CORE_MSG_RATE * (long long)cores;
-    if (denom == 0) return 0;
-    long long secs = div_up(totalMessages, denom);
+// sequential simulated time (1 core)
+static long long simulated_time_ms_nonthread(long long totalMsgs) {
+    long long secs = div_up(totalMsgs, CORE_MSG_RATE);
     return secs * 1000LL;
 }
 
-// threaded simulated time (divide load across threads)
-static long long simulated_time_ms_threaded(long long totalMessages, int threads) {
-    if (threads <= 0) threads = 1;
-    long long base = totalMessages / threads;
-    long long rem = totalMessages % threads;
-    long long maxMsgs = base + (rem > 0 ? 1 : 0);
-    long long secs = div_up(maxMsgs, CORE_MSG_RATE);
-    return secs * 1000LL;
+// ==================== Worker Thread Structs =====================
+struct WorkerArg {
+    const UserDevice* arr;
+    int startIndex;
+    int endIndex;
+    int msgsPerUser;
+};
+
+struct WorkerResult {
+    int usersProcessed;
+    long long messagesProcessed;
+};
+
+void* worker_func(void* v) {
+    WorkerArg* a = (WorkerArg*)v;
+    WorkerResult* r = new WorkerResult;
+    r->usersProcessed = 0;
+    r->messagesProcessed = 0;
+
+    for (int i = a->startIndex; i < a->endIndex; i++) {
+        r->usersProcessed++;
+        r->messagesProcessed += a->msgsPerUser;
+    }
+    return (void*)r;
 }
 
+// ==================== MAIN =====================
 int main() {
-    io.outputstring("Cellular Network Simulator\n");
-    io.outputstring("Project PDF: /mnt/data/OOPD____Project____2025.pdf\n");
-    io.outputstring("Select standard:\n");
-    io.outputstring("1 = 2G\n2 = 3G\n3 = 4G\n4 = 5G\n");
+    try {
 
-    int choice = io.inputint();
+        io.outputstring("Cellular Network Simulator\n");
+        io.outputstring("Project PDF: /mnt/data/OOPD____Project____2025.pdf\n");
 
-    // create standard objects (raw pointers)
-    CommunicationStandard* allStd[4];
-    allStd[0] = new TwoG();
-    allStd[1] = new ThreeG();
-    allStd[2] = new FourG();
-    allStd[3] = new FiveG();
+        io.outputstring("Select standard:\n");
+        io.outputstring("1 = 2G\n2 = 3G\n3 = 4G\n4 = 5G\n");
 
-    if (choice < 1 || choice > 4) {
-        io.errorstring("Invalid choice\n");
-        delete allStd[0]; delete allStd[1]; delete allStd[2]; delete allStd[3];
+        int choice = io.inputint();
+
+        if (choice < 1 || choice > 4) {
+            throw InvalidInputException("Invalid standard choice (must be 1–4)");
+        }
+
+        CommunicationStandard* stds[4];
+        stds[0] = new TwoG();
+        stds[1] = new ThreeG();
+        stds[2] = new FourG();
+        stds[3] = new FiveG();
+
+        CommunicationStandard* st = stds[choice - 1];
+
+        io.outputstring("Enter number of user devices:\n");
+        int requested = -1;
+
+        while (requested <= 0) {
+            requested = io.inputint();
+            if (requested <= 0)
+                io.errorstring("Enter positive integer:\n");
+        }
+
+        // Template usage (does not change functionality)
+        debugPrint("DEBUG: Users requested = ", requested);
+
+        // tower + core objects
+        CellTower tower(st);
+        CellularCore core(st);
+
+        // limits
+        int msgsPerUser = st->messagesPerUser();
+        int overhead = st->overheadPer100Messages();
+        int bandwidthCap = tower.totalSupportedUsers();
+
+        long long coreMsgCap = 200000LL;
+        long long coreMaxUsers = (coreMsgCap * 100LL) /
+                                 ((long long)msgsPerUser * (100LL + overhead));
+
+        long long finalAllowed = bandwidthCap < coreMaxUsers ? bandwidthCap : coreMaxUsers;
+
+        if (requested > finalAllowed) {
+            io.outputstring("Warning: Requested exceeds capacity.\n");
+            io.outputstring("Bandwidth limit: "); io.outputint(bandwidthCap); io.outputstring("\n");
+            io.outputstring("Core limit: "); io.outputint((int)coreMaxUsers); io.outputstring("\n");
+            io.outputstring("Using only "); io.outputint((int)finalAllowed); io.outputstring(" users.\n");
+            requested = (int)finalAllowed;
+        }
+
+        if (requested > bandwidthCap) {
+            throw CapacityExceededException("User count exceeds tower capacity!");
+        }
+
+        tower.reserve(requested);
+        for (int i = 0; i < requested; i++)
+            tower.addUser(UserDevice(i + 1));
+
+        int totalUsers = tower.currentUserCount();
+        int channels = tower.numChannels();
+        int perChanCap = tower.usersPerChanCapacity();
+
+        long long totalMessages = totalUsers * msgsPerUser;
+
+        // ============================================================
+        // Thread count using sysconf()
+        // ============================================================
+        long sc = sysconf(_SC_NPROCESSORS_ONLN);
+        int threads = (sc > 0) ? (int)sc : 4;
+        if (threads > totalUsers) threads = totalUsers;
+        if (threads <= 0) threads = 1;
+
+        // ============================================================
+        // ======== OUTPUT BASIC RESULTS ===============================
+        // ============================================================
+        io.outputstring("--- Simulation Results ---\n");
+        io.outputstring("Total channels: "); io.outputint(channels); io.outputstring("\n");
+        io.outputstring("Tower capacity: "); io.outputint(bandwidthCap); io.outputstring("\n");
+        io.outputstring("Core capacity: "); io.outputint((int)coreMaxUsers); io.outputstring("\n");
+        io.outputstring("Final users added: "); io.outputint(totalUsers); io.outputstring("\n");
+        io.outputstring("Messages generated: "); io.outputint((int)totalMessages); io.outputstring("\n");
+
+        // FIRST CHANNEL USERS
+        io.outputstring("Users in first channel: ");
+        int firstCap = perChanCap < totalUsers ? perChanCap : totalUsers;
+        if (firstCap > 0) {
+            UserDevice* buf = new UserDevice[firstCap];
+            int k = tower.usersInFirstChannel(buf, firstCap);
+            for (int i = 0; i < k; i++) {
+                io.outputint(buf[i].getID());
+                io.outputstring(" ");
+            }
+            delete[] buf;
+        }
+        io.outputstring("\n");
+
+        // CHANNEL PRINTING
+        io.outputstring("=== CHANNEL INFORMATION ===\n");
+        io.outputstring("Total possible channels: ");
+        io.outputint(channels);
+        io.outputstring("\n\n");
+
+        io.outputstring("=== ACTIVE CHANNELS ONLY ===\n");
+        const UserDevice* arr = tower.userArray();
+        int printed = 0;
+
+        for (int ch = 0; ch < channels; ch++) {
+            int start = ch * perChanCap;
+            if (start >= totalUsers) break;
+
+            int end = start + perChanCap;
+            if (end > totalUsers) end = totalUsers;
+
+            ChannelRange<int> cr(arr[start].getID(), arr[end - 1].getID());
+            cr.print(ch + 1);
+
+
+            printed++;
+        }
+
+        io.outputstring("Unused channels: ");
+        io.outputint(channels - printed);
+        io.outputstring("\n");
+
+        // ============================================================
+        // ========== REAL THREADING (pthread) ========================
+        // ============================================================
+        io.outputstring("--- Threading Comparison (real pthreads) ---\n");
+        io.outputstring("Threads used: "); io.outputint(threads); io.outputstring("\n");
+
+        pthread_t* tarr = new pthread_t[threads];
+        WorkerArg* args = new WorkerArg[threads];
+        WorkerResult* res = new WorkerResult[threads];
+
+        int base = totalUsers / threads;
+        int rem = totalUsers % threads;
+
+        int start = 0;
+        for (int t = 0; t < threads; t++) {
+            int chunk = base + (t < rem ? 1 : 0);
+            args[t].arr = arr;
+            args[t].startIndex = start;
+            args[t].endIndex = start + chunk;
+            args[t].msgsPerUser = msgsPerUser;
+
+            if (pthread_create(&tarr[t], NULL, worker_func, &args[t]) != 0) {
+                throw ThreadException("Failed to create thread");
+            }
+
+            start += chunk;
+        }
+
+        long long maxMsgs = 0;
+
+        for (int t = 0; t < threads; t++) {
+            void* p;
+            pthread_join(tarr[t], &p);
+            WorkerResult* wr = (WorkerResult*)p;
+
+            res[t] = *wr;
+            if (wr->messagesProcessed > maxMsgs)
+                maxMsgs = wr->messagesProcessed;
+
+            delete wr;
+        }
+
+        long long timeNonThread_ms = simulated_time_ms_nonthread(totalMessages);
+        long long timeThread_ms = simulated_time_ms_nonthread(maxMsgs);
+
+        io.outputstring("Simulated time (non-threaded): ");
+        io.outputint((int)timeNonThread_ms);
+        io.outputstring(" ms\n");
+
+        io.outputstring("Simulated time (threaded): ");
+        io.outputint((int)timeThread_ms);
+        io.outputstring(" ms\n");
+
+        io.outputstring("Speedup: ");
+        io.outputint((int)(timeNonThread_ms / timeThread_ms));
+        io.outputstring("x\n");
+
+        io.outputstring("Per-thread distribution:\n");
+        for (int t = 0; t < threads; t++) {
+            io.outputstring(" Thread ");
+            io.outputint(t + 1);
+            io.outputstring(": users=");
+            io.outputint(res[t].usersProcessed);
+            io.outputstring(" messages=");
+            io.outputint((int)res[t].messagesProcessed);
+            io.outputstring("\n");
+        }
+
+        delete[] tarr;
+        delete[] args;
+        delete[] res;
+
+        // SPEED
+        io.outputstring("Speed of selected technology: ");
+        int s10 = st->speedMbpsTimes10();
+        io.outputint(s10 / 10); io.outputstring(".");
+        io.outputint(s10 % 10); io.outputstring(" Mbps\n");
+
+        io.outputstring("Relative to 2G: ");
+        io.outputint(s10);
+        io.outputstring("x faster\n");
+
+        // COMPARISON ALL STANDARDS
+        io.outputstring("--- Comparison across all standards ---\n");
+        for (int i = 0; i < 4; i++) {
+            CommunicationStandard* s = stds[i];
+            long long chn = s->totalBandwidthKHz() / s->channelBandwidthKHz();
+            long long perC = (long long)s->usersPerChannel() * s->antennas();
+
+            long long bcap = chn * perC;
+            long long d2 = (long long)s->messagesPerUser() * (100 + s->overheadPer100Messages());
+            long long ccap = (d2 > 0) ? (coreMsgCap * 100LL) / d2 : 0;
+
+            io.outputstring("Standard ");
+            io.outputint(i + 1);
+            io.outputstring(": channels=");
+            io.outputint((int)chn);
+            io.outputstring(", bandwidth_cap=");
+            io.outputint((int)bcap);
+            io.outputstring(", core_cap=");
+            io.outputint((int)ccap);
+            io.outputstring(", speed=");
+            io.outputint(s->speedMbpsTimes10() / 10);
+            io.outputstring(".");
+            io.outputint(s->speedMbpsTimes10() % 10);
+            io.outputstring(" Mbps\n");
+        }
+
+        delete stds[0]; delete stds[1]; delete stds[2]; delete stds[3];
+
+        io.terminate();
+        return 0;
+
+    } catch (BaseException& e) {
+        io.errorstring("EXCEPTION: ");
+        io.errorstring(e.what());
+        io.errorstring("\n");
         return 1;
     }
-
-    CommunicationStandard* st = allStd[choice - 1];
-
-    io.outputstring("Enter number of user devices to add:\n");
-    int requested = -1;
-    while (true) {
-        requested = io.inputint();
-        if (requested > 0) break;
-        io.errorstring("Invalid input. Please enter a positive integer:\n");
-    }
-
-    // build tower and core
-    CellTower tower(st);
-    CellularCore core(st);
-
-    // compute bandwidth capacity
-    int bandwidthCapacity = tower.totalSupportedUsers();
-
-    // compute core capacity based on overhead per 100 messages
-    int msgsPerUser = st->messagesPerUser();
-    int overheadPer100 = st->overheadPer100Messages();
-
-    const long long coreMessageCapacity = 200000LL; // simulation parameter
-    long long numerator = coreMessageCapacity * 100LL;
-    long long denom = (long long)msgsPerUser * (100LL + overheadPer100);
-    long long coreMaxUsers = 0;
-    if (denom > 0) coreMaxUsers = numerator / denom;
-
-    long long finalAllowed = (bandwidthCapacity < coreMaxUsers) ? bandwidthCapacity : coreMaxUsers;
-
-    int usersToAdd = requested;
-    if ((long long)requested > finalAllowed) {
-        io.outputstring("Warning: Requested users exceed capacity.\n");
-        io.outputstring("Capacity by bandwidth: "); io.outputint(bandwidthCapacity); io.outputstring("\n");
-        io.outputstring("Capacity by core (after overhead): "); io.outputint((int)coreMaxUsers); io.outputstring("\n");
-        io.outputstring("Adding only "); io.outputint((int)finalAllowed); io.outputstring(" users.\n");
-        usersToAdd = (int)finalAllowed;
-    }
-
-    // reserve and add users
-    tower.reserve(usersToAdd);
-    for (int i = 0; i < usersToAdd; ++i) {
-        tower.addUser(UserDevice(i + 1));
-    }
-
-    int totalUsers = tower.currentUserCount();
-    int channels = tower.numChannels();
-    int perChanCap = tower.usersPerChanCapacity();
-
-    long long totalMessages = (long long)totalUsers * msgsPerUser;
-
-    unsigned int hw = std::thread::hardware_concurrency();
-    if (hw == 0) hw = 2;
-    int threads = (int)hw;
-    if (threads > totalUsers) threads = totalUsers;
-    if (threads <= 0) threads = 1;
-
-    long long time_threaded_ms = simulated_time_ms_threaded(totalMessages, threads);
-    long long time_nonthread_ms = simulated_time_ms_nonthread(totalMessages, 1);
-
-    // ---------------------------------------
-    // OUTPUT
-    // ---------------------------------------
-    io.outputstring("--- Simulation Results ---\n");
-    io.outputstring("Total channels: "); io.outputint(channels); io.outputstring("\n");
-    io.outputstring("Tower supports (max) users (bandwidth): "); io.outputint(bandwidthCapacity); io.outputstring("\n");
-    io.outputstring("Core supports (max) users (after overhead): "); io.outputint((int)coreMaxUsers); io.outputstring("\n");
-    io.outputstring("Final users added: "); io.outputint(totalUsers); io.outputstring("\n");
-    io.outputstring("Messages generated: "); io.outputint((int)totalMessages); io.outputstring("\n");
-
-    // first channel users
-    io.outputstring("Users in first channel (IDs): ");
-    int tempCap = perChanCap;
-    if (tempCap > totalUsers) tempCap = totalUsers;
-    if (tempCap > 0) {
-        UserDevice* buf = new UserDevice[tempCap];
-        int taken = tower.usersInFirstChannel(buf, tempCap);
-        for (int i = 0; i < taken; ++i) {
-            io.outputint(buf[i].getID());
-            io.outputstring(" ");
-        }
-        delete [] buf;
-    }
-    io.outputstring("\n");
-
-    // ************************************************************
-    // CLEAN CHANNEL PRINTING (ONLY active channels + summary)
-    // ************************************************************
-
-    io.outputstring("=== CHANNEL INFORMATION ===\n");
-
-    // 1) Print total channels available
-    io.outputstring("Total possible channels (based on bandwidth): ");
-    io.outputint(channels);
-    io.outputstring("\n\n");
-
-    // 2) Print only channels that actually contain users
-    io.outputstring("=== USERS IN ACTIVE CHANNELS ===\n");
-
-    const UserDevice* arr = tower.userArray();
-    int printedChannels = 0;
-
-    for (int ch = 0; ch < channels; ++ch) {
-        int start = ch * perChanCap;
-        if (start >= totalUsers) break;  // stop printing when no more users
-
-        io.outputstring("Channel ");
-        io.outputint(ch + 1);
-        io.outputstring(": ");
-
-        int end = start + perChanCap;
-        if (end > totalUsers) end = totalUsers;
-
-        for (int idx = start; idx < end; ++idx) {
-            io.outputint(arr[idx].getID());
-            io.outputstring(" ");
-        }
-        io.outputstring("\n");
-        printedChannels++;
-    }
-
-    // 3) Print unused channels summary
-    io.outputstring("\nUnused channels: ");
-    io.outputint(channels - printedChannels);
-    io.outputstring("\n");
-
-    // *************************************************************
-
-    // threading comparison
-    io.outputstring("--- Threading Comparison (simulated) ---\n");
-    io.outputstring("Threads used (hardware concurrency): "); io.outputint(threads); io.outputstring("\n");
-    io.outputstring("Simulated time (non-threaded, single core) ms: "); io.outputint((int)time_nonthread_ms); io.outputstring("\n");
-    io.outputstring("Simulated time (threaded) ms: "); io.outputint((int)time_threaded_ms); io.outputstring("\n");
-
-    int speedup = 0;
-    if (time_threaded_ms > 0) speedup = (int)(time_nonthread_ms / time_threaded_ms);
-    io.outputstring("Approx speedup (non-threaded / threaded): "); io.outputint(speedup); io.outputstring("x\n");
-
-    io.outputstring("Per-thread simulated distribution:\n");
-    int base = totalUsers / threads;
-    int rem = totalUsers % threads;
-    for (int t = 0; t < threads; ++t) {
-        int ucount = base + (t < rem ? 1 : 0);
-        long long msgs = (long long)ucount * msgsPerUser;
-        io.outputstring(" Thread ");
-        io.outputint(t + 1);
-        io.outputstring(": users=");
-        io.outputint(ucount);
-        io.outputstring("; messages=");
-        io.outputint((int)msgs);
-        io.outputstring("\n");
-    }
-
-    // speed
-    io.outputstring("Speed of selected technology: ");
-    int s10 = st->speedMbpsTimes10();
-    io.outputint(s10 / 10); io.outputstring(".");
-    io.outputint(s10 % 10); io.outputstring(" Mbps\n");
-    io.outputstring("Relative to 2G: "); io.outputint(s10 / 1); io.outputstring("x faster\n");
-
-    // comparison all standards
-    io.outputstring("--- Comparison across all standards ---\n");
-    for (int i = 0; i < 4; ++i) {
-        CommunicationStandard* s = allStd[i];
-        long long chnum = s->totalBandwidthKHz() / s->channelBandwidthKHz();
-        long long perchan = (long long)s->usersPerChannel() * s->antennas();
-        long long bcap = chnum * perchan;
-        long long denom2 = (long long)s->messagesPerUser() * (100 + s->overheadPer100Messages());
-        long long cmax = 0;
-        if (denom2 > 0) cmax = (coreMessageCapacity * 100LL) / denom2;
-        io.outputstring("Standard "); io.outputint(i + 1);
-        io.outputstring(": channels="); io.outputint((int)chnum);
-        io.outputstring(", bandwidth_cap="); io.outputint((int)bcap);
-        io.outputstring(", core_cap="); io.outputint((int)cmax);
-        io.outputstring(", speed=");
-        io.outputint(s->speedMbpsTimes10() / 10); io.outputstring(".");
-        io.outputint(s->speedMbpsTimes10() % 10); io.outputstring(" Mbps\n");
-    }
-
-    delete allStd[0]; delete allStd[1]; delete allStd[2]; delete allStd[3];
-
-    io.terminate();
-    return 0;
 }
-//Updated by Gagandeep
+
+//Kinshuk

@@ -2,9 +2,10 @@ CXX = g++
 CXXFLAGS = -std=c++17 -Wall -Wextra -Iinclude
 LDFLAGS = -pthread
 
-# C++ source files (ONLY the real ones)
+# C++ source files (add every .cpp here)
 CPP_SRC = \
     src/basicIO.cpp \
+    src/Exception.cpp \
     src/main.cpp
 
 # Assembly source file
@@ -26,7 +27,6 @@ release: CXXFLAGS += -O3
 release: build_dir $(OBJ)
 	$(CXX) -nostartfiles $(CXXFLAGS) $(OBJ) $(LDFLAGS) -o cellsim
 
-
 build_dir:
 	mkdir -p build
 
@@ -34,7 +34,7 @@ build_dir:
 build/%.o: src/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# Assemble .S → .o    
+# Assemble .S → .o
 build/%.o: src/%.S
 	nasm -f elf64 $< -o $@
 
@@ -42,4 +42,5 @@ clean:
 	rm -rf build cellsim cellsim_debug
 
 .PHONY: all debug release clean build_dir
-#updated by Gagandeep
+
+#Kinshuk
